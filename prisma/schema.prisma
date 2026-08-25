@@ -1,0 +1,514 @@
+// Debt Accounting Module — multi-entity corporate debt ledger
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  VIEWER
+  ACCOUNTANT
+  ADMIN
+}
+
+enum InstrumentType {
+  FUNDING_AGREEMENT
+  TERM_LOAN
+  REVOLVER
+  SENIOR_NOTES
+  PREFERRED
+  OTHER
+}
+
+enum InstrumentStatus {
+  ACTIVE
+  MATURED
+  REPAID
+  DRAFT
+}
+
+enum RateType {
+  FIXED
+  FLOATING
+}
+
+enum DayCount {
+  ACT_360
+  ACT_365
+  THIRTY_360
+}
+
+enum PaymentFrequency {
+  MONTHLY
+  QUARTERLY
+  SEMI_ANNUAL
+  ANNUAL
+}
+
+enum ResetFrequency {
+  DAILY
+  MONTHLY
+  QUARTERLY
+  SEMI_ANNUAL
+  ANNUAL
+}
+
+enum CashEventType {
+  INTEREST
+  PRINCIPAL
+  FEE
+  DIVIDEND
+  ISSUANCE_COST
+}
+
+enum CashEventStatus {
+  PLANNED
+  PAID
+  CANCELLED
+}
+
+enum JournalStatus {
+  DRAFT
+  POSTED
+  REVERSED
+}
+
+enum AccrualStatus {
+  COMPUTED
+  POSTED
+  REVERSED
+}
+
+enum MonthlyCloseStatus {
+  OPEN
+  IN_PROGRESS
+  READY_TO_POST
+  POSTED
+  LOCKED
+}
+
+enum MonthlyStepKey {
+  NEW_DEBT
+  UPFRONT_COSTS
+  REVOLVER_ACTIVITY
+  RATE_UPDATES
+  PAYMENTS
+  ACCRUALS
+  GL_EXPORT
+}
+
+enum MonthlyStepStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETE
+  SKIPPED
+}
+
+enum RevolverActivityType {
+  DRAW
+  REPAY
+  TRUE_UP
+  UNUSED_FEE
+}
+
+model User {
+  id           String       @id @default(cuid())
+  email        String       @unique
+  name         String
+  passwordHash String
+  role         Role         @default(VIEWER)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  auditEvents  AuditEvent[]
+}
+
+model Entity {
+  id           String           @id @default(cuid())
+  code         String           @unique
+  name         String
+  /// Company code sent to the G/L (often same as code)
+  companyCode  String           @default("")
+  /// Reporting segment (e.g. LIFE, RE, CORP)
+  segmentCode  String           @default("CORP")
+  parentId     String?
+  parent       Entity?          @relation("EntityHierarchy", fields: [parentId], references: [id])
+  children     Entity[]         @relation("EntityHierarchy")
+  instruments  DebtInstrument[]
+  journalEntries JournalEntry[]
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+}
+
+model DebtInstrument {
+  id                String            @id @default(cuid())
+  entityId          String
+  entity            Entity            @relation(fields: [entityId], references: [id])
+  name              String
+  instrumentNumber  String            @unique
+  type              InstrumentType
+  status            InstrumentStatus  @default(ACTIVE)
+  counterparty      String
+  currency          String            @default("USD")
+  issueDate         DateTime
+  maturityDate      DateTime
+  // Principal / balances in integer cents
+  originalPrincipal BigInt
+  currentPrincipal  BigInt
+  // Issuance costs / OID / premium in cents (positive = costs or discount reducing carrying value)
+  issuanceCosts     BigInt            @default(0)
+  unamortizedCosts  BigInt            @default(0)
+  // Premium positive increases carrying; store separately as signed cents on premiumDiscount
+  premiumDiscount   BigInt            @default(0) // positive = premium, negative = discount remaining
+  // Revolver
+  commitment        BigInt?
+  unusedFeeRateBps  Int?
+  // Preferred
+  dividendRateBps   Int?
+  cumulative        Boolean?
+  // Covenant notes (MVP free-text; engine is future state)
+  covenantNotes     String?
+  rateTerm          RateTerm?
+  rateObservations  RateObservation[]
+  cashEvents        CashEvent[]
+  journalEntries    JournalEntry[]
+  accrualRuns       AccrualRun[]
+  amortizationRows  AmortizationRow[]
+  revolverActivities RevolverActivity[]
+  agreementDocuments AgreementDocument[]
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+}
+
+model RateTerm {
+  id                String          @id @default(cuid())
+  instrumentId      String          @unique
+  instrument        DebtInstrument  @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+  rateType          RateType
+  // Fixed coupon in basis points (e.g. 525 = 5.25%)
+  fixedRateBps      Int?
+  // Floating — prefer ReferenceRate; indexName kept as denormalized label
+  referenceRateId   String?
+  referenceRate     ReferenceRate?  @relation(fields: [referenceRateId], references: [id])
+  indexName         String?         // e.g. SOFR (legacy / display)
+  spreadBps         Int?
+  resetFrequency    ResetFrequency?
+  paymentFrequency  PaymentFrequency
+  dayCount          DayCount        @default(ACT_360)
+  floorBps          Int?
+  capBps            Int?
+  lookbackDays      Int?            @default(0)
+  // Effective interest yield in bps (annualized), updated prospectively on floating resets
+  effectiveYieldBps Int?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+}
+
+/// Catalog of public reference rates (e.g. 1M Term SOFR vs 3M Term SOFR)
+model ReferenceRate {
+  id             String     @id @default(cuid())
+  code           String     @unique // e.g. SOFR_1M, SOFR_3M
+  name           String // e.g. 1-Month Term SOFR
+  indexFamily    String     @default("SOFR")
+  tenorLabel     String // e.g. 1M, 3M, ON
+  /// Public source name shown to users
+  sourceName     String
+  /// Public URL where the rate is published
+  sourceUrl      String
+  /// Decimal places for percent display/entry (e.g. 2 → 4.32%, 5 → 4.32100%)
+  decimalPlaces  Int        @default(2)
+  active         Boolean    @default(true)
+  notes          String?
+  rateTerms      RateTerm[]
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+}
+
+model RateObservation {
+  id             String         @id @default(cuid())
+  instrumentId   String
+  instrument     DebtInstrument @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+  effectiveDate  DateTime
+  endDate        DateTime?
+  indexFixingBps Int            // index in bps (e.g. 432 = 4.32%)
+  spreadBps      Int
+  allInRateBps   Int            // index + spread after floor/cap
+  source         String         @default("manual")
+  notes          String?
+  createdAt      DateTime       @default(now())
+}
+
+model CashEvent {
+  id           String          @id @default(cuid())
+  instrumentId String
+  instrument   DebtInstrument  @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+  type         CashEventType
+  status       CashEventStatus @default(PLANNED)
+  dueDate      DateTime
+  paidDate     DateTime?
+  amountCents  BigInt
+  principalCents BigInt        @default(0)
+  interestCents  BigInt        @default(0)
+  notes        String?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+}
+
+model JournalEntry {
+  id              String          @id @default(cuid())
+  entityId        String
+  entity          Entity          @relation(fields: [entityId], references: [id])
+  instrumentId    String?
+  instrument      DebtInstrument? @relation(fields: [instrumentId], references: [id])
+  monthlyCloseId  String?
+  monthlyClose    MonthlyClose?   @relation(fields: [monthlyCloseId], references: [id])
+  glExportBatchId String?
+  glExportBatch   GlExportBatch?  @relation(fields: [glExportBatchId], references: [id])
+  entryDate       DateTime
+  memo            String
+  status          JournalStatus   @default(POSTED)
+  source          String          // accrual | payment | amortization | draw | repay | true_up | manual
+  lines           JournalLine[]
+  createdAt       DateTime        @default(now())
+}
+
+model JournalLine {
+  id             String       @id @default(cuid())
+  journalEntryId String
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+  accountCode    String
+  accountName    String
+  debitCents     BigInt       @default(0)
+  creditCents    BigInt       @default(0)
+  /// G/L coding dimensions
+  companyCode    String       @default("")
+  segmentCode    String       @default("")
+  costCenter     String       @default("")
+  productLine    String       @default("")
+  intercompany   String       @default("")
+  projectCode    String       @default("")
+}
+
+model AccrualRun {
+  id             String         @id @default(cuid())
+  instrumentId   String
+  instrument     DebtInstrument @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+  periodStart    DateTime
+  periodEnd      DateTime
+  rateBpsUsed    Int
+  dayCountUsed   DayCount
+  days           Int
+  interestCents  BigInt
+  status         AccrualStatus  @default(COMPUTED)
+  journalEntryId String?
+  createdAt      DateTime       @default(now())
+}
+
+model AmortizationRow {
+  id                    String         @id @default(cuid())
+  instrumentId          String
+  instrument            DebtInstrument @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+  periodEnd             DateTime
+  openingCarryingCents  BigInt
+  cashInterestCents     BigInt
+  effectiveInterestCents BigInt
+  amortizationCents     BigInt
+  closingCarryingCents  BigInt
+  effectiveYieldBps     Int
+  journalEntryId        String?
+  createdAt             DateTime       @default(now())
+}
+
+model AuditEvent {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String
+  entityType String
+  entityId   String?
+  detail     String?
+  createdAt  DateTime @default(now())
+}
+
+// Future-state covenant hooks (no engine in MVP)
+model CovenantDefinition {
+  id          String   @id @default(cuid())
+  name        String
+  metricKey   String   // e.g. leverage, interest_coverage
+  entityId    String?  // null = consolidated
+  threshold   Float
+  operator    String   // lte | gte
+  frequency   String   @default("quarterly")
+  notes       String?
+  createdAt   DateTime @default(now())
+  tests       CovenantTest[]
+  agreementDocuments AgreementDocument[]
+}
+
+model CovenantTest {
+  id           String             @id @default(cuid())
+  definitionId String
+  definition   CovenantDefinition @relation(fields: [definitionId], references: [id], onDelete: Cascade)
+  testDate     DateTime
+  actualValue  Float?
+  status       String             @default("PENDING") // PENDING | PASS | FAIL | WATCH
+  notes        String?
+  createdAt    DateTime           @default(now())
+}
+
+enum AgreementDocumentKind {
+  DEBT_AGREEMENT
+  COVENANT_AGREEMENT
+}
+
+enum AgreementDocumentStatus {
+  UPLOADED
+  ANALYZING
+  READY_FOR_REVIEW
+  APPROVED
+  REJECTED
+}
+
+/// Uploaded debt / covenant agreement PDFs with extracted terms pending review
+model AgreementDocument {
+  id                   String                  @id @default(cuid())
+  kind                 AgreementDocumentKind
+  status               AgreementDocumentStatus @default(UPLOADED)
+  title                String
+  originalFileName     String
+  mimeType             String                  @default("application/pdf")
+  storagePath          String
+  fileSizeBytes        Int
+  /// Optional entity scope for onboarding
+  entityId             String?
+  /// Raw text extracted from the PDF (truncated for storage)
+  extractedText        String?
+  /// Heuristic / LLM-proposed terms (JSON matching debt or covenant draft shape)
+  extractedTerms       Json?
+  /// User-edited terms after review (JSON); becomes source of truth on approve
+  reviewedTerms        Json?
+  analysisNotes        String?
+  analysisMethod       String? // heuristic | llm | heuristic+llm
+  analyzedAt           DateTime?
+  reviewedAt           DateTime?
+  approvedAt           DateTime?
+  uploadedById         String?
+  reviewedById         String?
+  /// Created instrument after debt agreement approval
+  debtInstrumentId     String?
+  debtInstrument       DebtInstrument?         @relation(fields: [debtInstrumentId], references: [id])
+  /// Primary covenant created on approve (package may create more; see reviewedTerms)
+  covenantDefinitionId String?
+  covenantDefinition   CovenantDefinition?     @relation(fields: [covenantDefinitionId], references: [id])
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
+}
+
+model MonthlyClose {
+  id           String             @id @default(cuid())
+  periodLabel  String             @unique // e.g. 2026-08
+  periodStart  DateTime
+  periodEnd    DateTime
+  status       MonthlyCloseStatus @default(OPEN)
+  notes        String?
+  createdById  String?
+  completedAt  DateTime?
+  steps        MonthlyCloseStep[]
+  journalEntries JournalEntry[]
+  glExports    GlExportBatch[]
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+}
+
+model MonthlyCloseStep {
+  id             String            @id @default(cuid())
+  monthlyCloseId String
+  monthlyClose   MonthlyClose      @relation(fields: [monthlyCloseId], references: [id], onDelete: Cascade)
+  stepKey        MonthlyStepKey
+  status         MonthlyStepStatus @default(PENDING)
+  completedAt    DateTime?
+  notes          String?
+  sortOrder      Int
+}
+
+model RevolverActivity {
+  id               String               @id @default(cuid())
+  instrumentId     String
+  instrument       DebtInstrument       @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+  activityDate     DateTime
+  type             RevolverActivityType
+  amountCents      BigInt               // draw/repay absolute; true-up = signed adjustment to reach bank balance
+  balanceAfterCents BigInt
+  bankBalanceCents BigInt?              // bank statement balance for true-up
+  ourBalanceBeforeCents BigInt?
+  notes            String?
+  journalEntryId   String?
+  createdAt        DateTime             @default(now())
+}
+
+model GlExportBatch {
+  id             String         @id @default(cuid())
+  monthlyCloseId String?
+  monthlyClose   MonthlyClose?  @relation(fields: [monthlyCloseId], references: [id])
+  label          String
+  periodStart    DateTime
+  periodEnd      DateTime
+  status         String         @default("GENERATED") // GENERATED | DOWNLOADED | POSTED_EXTERNAL
+  lineCount      Int            @default(0)
+  debitTotalCents BigInt        @default(0)
+  creditTotalCents BigInt       @default(0)
+  journalEntries JournalEntry[]
+  createdAt      DateTime       @default(now())
+}
+
+enum GlAccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+/// Company chart of accounts used for GL posting
+model GlAccount {
+  id          String        @id @default(cuid())
+  code        String        @unique
+  name        String
+  accountType GlAccountType
+  active      Boolean       @default(true)
+  description String?
+  debitMaps   GlAccountMapping[] @relation("DebitAccount")
+  creditMaps  GlAccountMapping[] @relation("CreditAccount")
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+}
+
+/// Maps an internal debt transaction type to debit/credit COA accounts
+model GlAccountMapping {
+  id              String     @id @default(cuid())
+  /// e.g. INTEREST_ACCRUAL | INTEREST_PAYMENT | PRINCIPAL_PAYMENT | EIR_AMORTIZATION | REVOLVER_DRAW | REVOLVER_REPAY | REVOLVER_TRUE_UP
+  transactionType String
+  label           String
+  /// "*" = default for all entities; otherwise Entity.id
+  entityKey       String     @default("*")
+  debitAccountId  String
+  debitAccount    GlAccount  @relation("DebitAccount", fields: [debitAccountId], references: [id])
+  creditAccountId String
+  creditAccount   GlAccount  @relation("CreditAccount", fields: [creditAccountId], references: [id])
+  /// Default coding dimensions applied when posting (blank = inherit from entity)
+  companyCode     String     @default("")
+  segmentCode     String     @default("")
+  costCenter      String     @default("")
+  productLine     String     @default("")
+  intercompany    String     @default("")
+  projectCode     String     @default("")
+  active          Boolean    @default(true)
+  notes           String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@unique([transactionType, entityKey])
+}

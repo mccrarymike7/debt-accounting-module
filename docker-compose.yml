@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: debt-accounting-pg
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: debt
+      POSTGRES_PASSWORD: debt
+      POSTGRES_DB: debt_accounting
+    volumes:
+      - debt_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U debt -d debt_accounting"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  debt_pg_data:

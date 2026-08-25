@@ -1,36 +1,66 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Aspida Debt Accounting Module
 
-## Getting Started
+Standalone internal web app for multi-entity corporate debt accounting (funding agreements, notes, revolvers), styled after [aspida.com](https://aspida.com).
 
-First, run the development server:
+## Database
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+**PostgreSQL** is the application database (source of truth for instruments, accruals, journals, monthly close).
+
+Local default connection:
+
+```text
+postgresql://debt:debt@localhost:5432/debt_accounting?schema=public
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Snowflake is a later analytics destination — not the OLTP store for this module.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Local Postgres (Homebrew)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+brew services start postgresql@16
+# DB/user already created for this project as debt / debt_accounting
+```
 
-## Learn More
+### Local Postgres (Docker)
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+docker compose up -d
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Setup
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+npm install
+cp .env.example .env   # if needed
+npx prisma generate
+npx prisma db push
+npm run db:seed
+npm run dev
+```
 
-## Deploy on Vercel
+Open [http://localhost:3000](http://localhost:3000).
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+### Demo users
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| Email | Password | Role |
+|-------|----------|------|
+| admin@aspida.local | password123 | ADMIN |
+| accountant@aspida.local | password123 | ACCOUNTANT |
+| viewer@aspida.local | password123 | VIEWER |
+
+## Features
+
+- Multi-entity debt book with consolidated and entity-filtered views
+- Funding agreements and floating rates (SOFR + spread)
+- Monthly process: new debt, revolver activity, rates, payments, accruals, GL CSV
+- Revolving facility draws / repayments / bank true-ups
+- Effective interest method for issuance costs
+- Covenant definitions UI (engine future state)
+- Agreement document repository: upload debt/covenant PDFs, extract terms, review & approve into the ledger
+
+## Scripts
+
+- `npm run dev` — development server
+- `npm run db:push` — sync Prisma schema to Postgres
+- `npm run db:seed` — reseed sample data
+- `npm run db:generate` — regenerate Prisma client
